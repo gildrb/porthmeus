@@ -125,20 +125,14 @@ fn socket_owners(pids: impl Iterator<Item = u32>) -> HashMap<u64, u32> {
     owners
 }
 
-/// Every TCP socket in LISTEN state held by one of `owners`.
-fn listening_sockets(owners: &HashMap<u64, u32>) -> Result<Vec<Listener>, String> {
+/// Every TCP socket in LISTEN state held by one of `owners`, with its pid.
+fn listening_sockets(owners: &HashMap<u64, u32>) -> Result<Vec<(u32, ListenSocket)>, String> {
     if owners.is_empty() {
         return Ok(Vec::new());
     }
     Ok(listen_table()?
         .into_iter()
-        .filter_map(|socket| {
-            owners.get(&socket.inode).map(|pid| Listener {
-                pid: *pid,
-                ip: socket.ip,
-                port: socket.port,
-            })
-        })
+        .filter_map(|socket| owners.get(&socket.inode).map(|pid| (*pid, socket)))
         .collect())
 }
 
@@ -165,9 +159,76 @@ pub fn listen_signature() -> Result<String, String> {
     Ok(signature)
 }
 
-/// Every listening TCP socket held by a process this user can inspect.
+/// Every listening TCP socket on the machine. The pid is set where this user
+/// can read the holder's descriptors; uid and cgroup come from the kernel.
 pub fn all_listeners() -> Result<Vec<Listener>, String> {
-    listening_sockets(&socket_owners(proc_pids()))
+    let sockets = listen_table()?;
+    let owners = socket_owners(proc_pids());
+    Ok(sockets
+        .into_iter()
+        .map(|socket| Listener {
+            pid: owners.get(&socket.inode).copied(),
+            ip: socket.ip,
+            port: socket.port,
+            uid: Some(socket.uid),
+            cgroup: socket.cgroup,
+        })
+        .collect())
+}
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Path below /sys/fs/cgroup of every cgroup v2 directory, keyed by cgroup
+/// id, which on 64-bit kernels is the directory's inode. Reads directory
+/// entries only; no stat per cgroup.
+pub fn cgroup_index() -> HashMap<u64, String> {
+    use std::os::unix::fs::{DirEntryExt as _, MetadataExt as _};
+    let mut index = HashMap::new();
+    let Ok(root) = std::fs::metadata(CGROUP_ROOT) else {
+        return index;
+    };
+    index.insert(root.ino(), "/".to_string());
+    let mut pending = vec![String::new()];
+    while let Some(relative) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(format!("{CGROUP_ROOT}{relative}")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let path = format!("{relative}/{name}");
+            index.insert(entry.ino(), path.clone());
+            pending.push(path);
+        }
+    }
+    index
+}
+
+/// Pids in the cgroup at `path` (as returned by `cgroup_index`); readable by
+/// everyone.
+pub fn cgroup_members(path: &str) -> Vec<u32> {
+    std::fs::read_to_string(format!("{CGROUP_ROOT}{path}/cgroup.procs"))
+        .map(|text| text.lines().filter_map(|line| line.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Real owner of a process: the uid of its /proc directory.
+pub fn process_uid(pid: u32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(format!("/proc/{pid}"))
+        .ok()
+        .map(|metadata| metadata.uid())
+}
+
+pub fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata("/proc/self")
+        .ok()
+        .map(|metadata| metadata.uid())
 }
 
 /// Listening loopback sockets held by the owned processes, with the pid
@@ -175,7 +236,7 @@ pub fn all_listeners() -> Result<Vec<Listener>, String> {
 /// against the kernel's LISTEN table.
 pub fn loopback_listeners(pids: &[u32]) -> Result<Vec<LoopbackListener>, String> {
     let mut listeners: BTreeMap<String, u32> = BTreeMap::new();
-    for listener in listening_sockets(&socket_owners(pids.iter().copied()))? {
+    for (pid, listener) in listening_sockets(&socket_owners(pids.iter().copied()))? {
         // A wildcard bind (0.0.0.0 / ::) also serves loopback clients;
         // many dev servers default to it.
         let host = if listener.ip.is_unspecified() {
@@ -187,7 +248,7 @@ pub fn loopback_listeners(pids: &[u32]) -> Result<Vec<LoopbackListener>, String>
         };
         listeners
             .entry(format!("{host}:{}", listener.port))
-            .or_insert(listener.pid);
+            .or_insert(pid);
     }
     Ok(listeners
         .into_iter()
@@ -199,6 +260,8 @@ struct ListenSocket {
     ip: std::net::IpAddr,
     port: u16,
     inode: u64,
+    uid: u32,
+    cgroup: Option<u64>,
 }
 
 // Kernel UAPI: linux/netlink.h, linux/sock_diag.h, linux/inet_diag.h.
@@ -315,7 +378,8 @@ fn dump_listeners(family: u8, sockets: &mut Vec<ListenSocket>) -> std::io::Resul
 
 /// struct inet_diag_msg: family u8, state u8, timer u8, retrans u8, then
 /// inet_diag_sockid (sport be16 @4, dport be16 @6, src [u8;16] @8, ...),
-/// expires, rqueue, wqueue, uid, and inode u32 @68.
+/// expires, rqueue, wqueue, uid u32 @64, and inode u32 @68; netlink
+/// attributes follow.
 fn parse_diag_message(message: &[u8]) -> Option<ListenSocket> {
     let port = u16::from_be_bytes([message[4], message[5]]);
     let source: [u8; 16] = message[8..24].try_into().ok()?;
@@ -326,12 +390,36 @@ fn parse_diag_message(message: &[u8]) -> Option<ListenSocket> {
         AF_INET6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(source)),
         _ => return None,
     };
+    let uid = u32::from_ne_bytes(message[64..68].try_into().ok()?);
     let inode = u32::from_ne_bytes(message[68..72].try_into().ok()?);
     Some(ListenSocket {
         ip,
         port,
         inode: u64::from(inode),
+        uid,
+        cgroup: cgroup_attribute(&message[DIAG_MESSAGE..]),
     })
+}
+
+/// INET_DIAG_CGROUP_ID (Linux 5.7+), sent unrequested for every full socket.
+const INET_DIAG_CGROUP_ID: u16 = 21;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+
+/// The cgroup id among the message's netlink attributes (struct nlattr:
+/// len u16, type u16, payload, padded to 4 bytes).
+fn cgroup_attribute(mut attributes: &[u8]) -> Option<u64> {
+    while attributes.len() >= 4 {
+        let length = usize::from(u16::from_ne_bytes([attributes[0], attributes[1]]));
+        let kind = u16::from_ne_bytes([attributes[2], attributes[3]]) & NLA_TYPE_MASK;
+        if length < 4 || length > attributes.len() {
+            return None;
+        }
+        if kind == INET_DIAG_CGROUP_ID && length == 12 {
+            return Some(u64::from_ne_bytes(attributes[4..12].try_into().ok()?));
+        }
+        attributes = attributes.get((length + 3) & !3..).unwrap_or_default();
+    }
+    None
 }
 
 fn format_host(ip: &std::net::IpAddr) -> String {

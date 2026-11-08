@@ -6,12 +6,18 @@ use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
-/// A listening TCP socket and the process holding it.
+/// A listening TCP socket. The kernel reports every socket's owner uid and
+/// cgroup; the holding process is known only when its descriptors are
+/// readable (the caller's own processes, or all of them as root).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listener {
-    pub pid: u32,
+    pub pid: Option<u32>,
     pub ip: std::net::IpAddr,
     pub port: u16,
+    pub uid: Option<u32>,
+    /// cgroup v2 id of the socket's creator (Linux): the inode of its
+    /// directory below /sys/fs/cgroup.
+    pub cgroup: Option<u64>,
 }
 
 /// Process metadata used by the dashboard.
@@ -248,10 +254,64 @@ fn split_host_port(address: &str) -> Result<(String, u32), String> {
     Ok((host, port))
 }
 
+/// Account names by uid from /etc/passwd. Directory-service accounts (macOS,
+/// LDAP) are absent; callers show those by number.
+pub fn user_names() -> HashMap<u32, String> {
+    let Ok(text) = std::fs::read_to_string("/etc/passwd") else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next().filter(|name| !name.is_empty())?;
+            let _password = fields.next()?;
+            let uid = fields.next()?.parse().ok()?;
+            Some((uid, name.to_string()))
+        })
+        .collect()
+}
+
+/// systemd's DynamicUser= range (`systemd-analyze` docs): accounts that
+/// exist only while their service runs and are absent from /etc/passwd.
+pub const DYNAMIC_USERS: std::ops::RangeInclusive<u32> = 61_184..=65_519;
+const USERDB_SOCKET: &str = "/run/systemd/userdb/io.systemd.DynamicUser";
+const USERDB_TIMEOUT: Duration = Duration::from_millis(200);
+const USERDB_MAX_BYTES: usize = 64 * 1024;
+
+/// The name of a DynamicUser= account, from systemd's userdb varlink
+/// socket (NUL-terminated JSON messages); None where there is no such socket.
+pub fn dynamic_user_name(uid: u32) -> Option<String> {
+    let mut stream = std::os::unix::net::UnixStream::connect(USERDB_SOCKET).ok()?;
+    stream.set_read_timeout(Some(USERDB_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(USERDB_TIMEOUT)).ok()?;
+    let request = serde_json::json!({
+        "method": "io.systemd.UserDatabase.GetUserRecord",
+        "parameters": { "uid": uid, "service": "io.systemd.DynamicUser" },
+    });
+    let mut bytes = serde_json::to_vec(&request).ok()?;
+    bytes.push(0);
+    stream.write_all(&bytes).ok()?;
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !reply.contains(&0) {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 || reply.len() + read > USERDB_MAX_BYTES {
+            return None;
+        }
+        reply.extend_from_slice(&chunk[..read]);
+    }
+    let end = reply.iter().position(|byte| *byte == 0)?;
+    let value: serde_json::Value = serde_json::from_slice(&reply[..end]).ok()?;
+    value
+        .pointer("/parameters/record/userName")?
+        .as_str()
+        .map(str::to_string)
+}
+
 #[cfg(target_os = "linux")]
 pub use proc_scan::{
-    all_listeners, listen_signature, loopback_listeners, owned_processes, process_table,
-    working_directories,
+    all_listeners, cgroup_index, cgroup_members, current_uid, listen_signature, loopback_listeners,
+    owned_processes, process_table, process_uid, working_directories,
 };
 
 #[cfg(target_os = "linux")]
@@ -259,8 +319,8 @@ mod proc_scan;
 
 #[cfg(not(target_os = "linux"))]
 pub use fallback_scan::{
-    all_listeners, listen_signature, loopback_listeners, owned_processes, process_table,
-    working_directories,
+    all_listeners, cgroup_index, cgroup_members, current_uid, listen_signature, loopback_listeners,
+    owned_processes, process_table, process_uid, working_directories,
 };
 
 #[cfg(not(target_os = "linux"))]

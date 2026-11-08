@@ -5,13 +5,14 @@ Open your development server on any device in your tailnet. Porthmeus runs your 
 ```sh
 curl -fsSL https://porthmeus.com/install | sh   # or: nix profile install github:gildrb/porthmeus
 porthmeus vp dev                                # any dev command; open the printed link (short: p vp dev)
+porthmeus                                       # the dashboard: every listening port and what it is
 ```
 
 Everything binds to 127.0.0.1. Only Tailscale exposes HTTPS, Serve never Funnel, under your tailnet access rules; certificate names are public in Certificate Transparency logs, the site is not. Host and Origin must match the route or the request gets 403. Each invocation owns only its own Serve route; exit removes exactly it, and `tailscale serve reset` is never run.
 
 The bridge is one static Rust binary with no runtime: stack buffers and no per-request name resolution, one-thread `poll(2)` relay for WebSocket, discovery that reads `/proc` and the kernel socket tables directly on Linux, and child output in an unlinked temp file — no capture threads.
 
-`porthmeus dashboard` lists every listening server your user owns with its Porthmeus URL, working directory, and command. `x` then `y` stops a row, `x` again offers a force-kill, `r` refreshes, `q` quits.
+`porthmeus` with no command opens the dashboard: every listening TCP port on the machine, its owner, and what it is, worked out offline from fixed rules: a Porthmeus session or Serve route, a Docker or Podman container (named through the engine's local socket when readable), a systemd unit, a known program, then the port's usual service. Your rows show their Porthmeus URL, working directory, and command; `x` then `y` stops one, `x` again offers a force-kill. Other users' ports are read-only, with as much as is visible without root. `m` shows only yours, `r` refreshes, `q` quits; piped, it prints a plain table.
 
 Requires Tailscale signed in on both devices with MagicDNS, HTTPS certificates, and access rules for the port, plus the project's usual tools. On Linux, once: `sudo tailscale set --operator="$USER"`. Porthmeus uses tailscaled's local socket where one exists, otherwise the `tailscale` CLI (`--tailscale-cli`).
 

@@ -4,6 +4,7 @@ use crate::localapi::Session;
 use crate::proxy::Bridge;
 use crate::serve::{serve_command, RESERVED_FUNNEL_PORTS};
 use crate::signal::Events;
+use crate::style::{print_error, Paint, Style};
 use crate::tailscale::{self, Tailscale};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -179,10 +180,9 @@ enum Exit {
 }
 
 pub fn run(args: Vec<String>) -> i32 {
-    let mut stderr = std::io::stderr();
     match parse_config(&args) {
         Ok(ParseOutcome::Help) => {
-            print!("{}", crate::cli::usage_text());
+            print!("{}", crate::cli::USAGE);
             0
         }
         Ok(ParseOutcome::Version(version)) => {
@@ -190,9 +190,15 @@ pub fn run(args: Vec<String>) -> i32 {
             0
         }
         Ok(ParseOutcome::Config(config)) => run_config(config),
-        Ok(ParseOutcome::Dashboard) => crate::dashboard::run(),
+        Ok(ParseOutcome::Dashboard { tailscale_cli }) => {
+            crate::dashboard::run(tailscale_cli.as_deref())
+        }
         Err(error) => {
-            let _ = writeln!(stderr, "porthmeus: {error}");
+            print_error(&error.to_string());
+            eprint!(
+                "\n{}\nRun \"porthmeus --help\" for more information.\n",
+                crate::cli::SHORT_USAGE
+            );
             2
         }
     }
@@ -221,11 +227,10 @@ impl Failure {
 
 fn run_config(c: Config) -> i32 {
     let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
     let events = match Events::install(&[]) {
         Ok(events) => events,
         Err(error) => {
-            let _ = writeln!(stderr, "porthmeus: {error}");
+            print_error(&error);
             return 1;
         }
     };
@@ -236,7 +241,7 @@ fn run_config(c: Config) -> i32 {
         Err(failure) => {
             if let Some(message) = failure.message {
                 if crate::signal::last_signal() == 0 {
-                    let _ = writeln!(stderr, "porthmeus: {message}");
+                    print_error(&message);
                 }
             }
             if failure.code == 0 {
@@ -276,6 +281,8 @@ fn supervise(c: &Config, events: &Events, stdout: &mut dyn Write) -> Result<(), 
         }
     }
 
+    announce_start(c);
+    let started = Instant::now();
     // Spawn the dev command in its own process group.
     let mut child_state: Option<ChildProcess> = None;
     if !c.command.is_empty() {
@@ -286,10 +293,12 @@ fn supervise(c: &Config, events: &Events, stdout: &mut dyn Write) -> Result<(), 
         tailscale: &tailscale,
         authority: format!("{}:{}", node.dns_name, https_port),
         https_port,
-        deadline: Instant::now() + c.timeout,
+        started,
+        deadline: started + c.timeout,
     };
     let terminal = child_state.as_ref().is_some_and(|child| child.terminal);
     let (exit, route) = run.execute(stdout, c.target.clone(), &mut child_state);
+    let interrupted = matches!(exit, Exit::Signal(_));
     // Stop the dev command first, then remove its route, as before.
     let failure = match exit {
         Exit::Signal(signal_number) => {
@@ -312,8 +321,67 @@ fn supervise(c: &Config, events: &Events, stdout: &mut dyn Write) -> Result<(), 
     }
     if let Some((route, ready)) = route {
         route.stop(&mut std::io::stderr(), ready);
+        if ready && interrupted {
+            announce_stop(&run.authority);
+        }
     }
     Err(failure)
+}
+
+/// One dim line on a terminal's stderr before the dev command's own output.
+fn announce_start(c: &Config) {
+    let style = Style::stderr();
+    if !style.is_terminal() {
+        return;
+    }
+    let doing = match (&c.target, c.command.first()) {
+        (Some(target), _) => format!("serving {}", target.url()),
+        (None, Some(program)) => format!(
+            "waiting up to {} for {} to listen on loopback",
+            short_duration(c.timeout),
+            program.rsplit('/').next().unwrap_or(program)
+        ),
+        (None, None) => return,
+    };
+    eprintln!(
+        "{}  {}",
+        style.paint(Paint::Accent, "porthmeus"),
+        style.paint(Paint::Dim, &crate::style::sanitize(&doing))
+    );
+}
+
+fn announce_stop(authority: &str) {
+    let style = Style::stderr();
+    if style.is_terminal() {
+        eprintln!(
+            "{}  {}",
+            style.paint(Paint::Accent, "porthmeus"),
+            style.paint(
+                Paint::Dim,
+                &format!("stopped; removed https://{authority}/")
+            )
+        );
+    }
+}
+
+/// `30s`, `5m`, `2h`, or `90s`: the largest whole unit.
+fn short_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0 => format!("{}ms", duration.as_millis()),
+        _ if seconds % 3600 == 0 => format!("{}h", seconds / 3600),
+        _ if seconds % 60 == 0 => format!("{}m", seconds / 60),
+        _ => format!("{seconds}s"),
+    }
+}
+
+/// `420ms` under a second, else `1.4s`.
+fn elapsed_text(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
 }
 
 /// One run's fixed parameters.
@@ -322,6 +390,7 @@ struct Run<'a> {
     tailscale: &'a Tailscale,
     authority: String,
     https_port: u16,
+    started: Instant,
     deadline: Instant,
 }
 
@@ -422,7 +491,7 @@ impl Run<'_> {
         ready: &mut bool,
     ) -> Exit {
         if matches!(route, Route::Local(_)) {
-            if let Err(failure) = announce(stdout, &self.authority, target) {
+            if let Err(failure) = announce(stdout, &self.authority, target, self.started) {
                 return Exit::Failed(failure);
             }
             *ready = true;
@@ -503,7 +572,7 @@ impl CliRoute {
         }
         let status = tailscale::read_serve_config(&self.cli).map_err(failed)?;
         if status.owns_route(&run.authority, &self.bridge_url) {
-            announce(stdout, &run.authority, target).map_err(Exit::Failed)?;
+            announce(stdout, &run.authority, target, run.started).map_err(Exit::Failed)?;
             *ready = true;
             return Ok(None);
         }
@@ -515,14 +584,36 @@ fn failed(message: impl Into<String>) -> Exit {
     Exit::Failed(Failure::error(message))
 }
 
-fn announce(stdout: &mut dyn Write, authority: &str, target: &TargetUrl) -> Result<(), Failure> {
-    writeln!(
-        stdout,
-        "Porthmeus URL: https://{authority}/\nLocal target: {}",
-        target.url()
-    )
-    .and_then(|()| stdout.flush())
-    .map_err(|error| Failure::error(error.to_string()))
+/// The link, with the local target it reaches. A terminal gets a styled block;
+/// anything else gets `key: value` lines for scripts.
+fn announce(
+    stdout: &mut dyn Write,
+    authority: &str,
+    target: &TargetUrl,
+    started: Instant,
+) -> Result<(), Failure> {
+    let url = format!("https://{authority}/");
+    let style = Style::stdout();
+    let text = if style.is_terminal() {
+        format!(
+            "\n{}  {}\n  {}     {}\n  {}  {}\n\n",
+            style.paint(Paint::Accent, "porthmeus"),
+            style.paint(
+                Paint::Good,
+                &format!("ready in {}", elapsed_text(started.elapsed()))
+            ),
+            style.paint(Paint::Dim, "url"),
+            style.paint(Paint::Bold, &style.paint(Paint::Accent, &url)),
+            style.paint(Paint::Dim, "target"),
+            target.url(),
+        )
+    } else {
+        format!("url: {url}\ntarget: {}\n", target.url())
+    };
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| Failure::error(error.to_string()))
 }
 
 fn reserve_port() -> Result<u16, String> {

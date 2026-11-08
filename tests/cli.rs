@@ -1,4 +1,4 @@
-use porthmeus::cli::{parse_config, usage_text, ParseOutcome};
+use porthmeus::cli::{parse_config, CliError, ParseOutcome, USAGE};
 
 fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| item.to_string()).collect()
@@ -46,21 +46,52 @@ fn double_dash_separates_command() {
 }
 
 #[test]
-fn rejects_missing_command_and_target() {
-    let error = parse_config(&args(&[])).expect_err("empty args rejected");
-    assert_eq!(error, "provide a command or --target");
+fn no_command_opens_the_dashboard() {
+    let outcome = parse_config(&args(&[])).expect("parses");
+    assert!(matches!(
+        outcome,
+        ParseOutcome::Dashboard {
+            tailscale_cli: None
+        }
+    ));
+    let outcome = parse_config(&args(&["--tailscale-cli", "/bin/tailscale"])).expect("parses");
+    assert!(matches!(
+        outcome,
+        ParseOutcome::Dashboard {
+            tailscale_cli: Some(_)
+        }
+    ));
+}
+
+#[test]
+fn dashboard_is_not_a_reserved_word() {
+    let outcome = parse_config(&args(&["dashboard"])).expect("parses");
+    let ParseOutcome::Config(config) = outcome else {
+        panic!("a program named dashboard runs as the target");
+    };
+    assert_eq!(config.command, vec!["dashboard"]);
+}
+
+#[test]
+fn serving_flags_need_a_command() {
+    let error = parse_config(&args(&["--https", "8443"])).expect_err("rejected");
+    assert_eq!(error, CliError::NeedsCommand("https"));
+    assert_eq!(error.to_string(), "--https needs a command or --target");
 }
 
 #[test]
 fn rejects_unknown_flag() {
     let error = parse_config(&args(&["-nope", "sh"])).expect_err("unknown flag rejected");
-    assert_eq!(error, "flag provided but not defined: -nope");
+    assert_eq!(error.to_string(), "unknown flag: --nope");
 }
 
 #[test]
 fn rejects_out_of_range_https_port() {
     let error = parse_config(&args(&["-https", "70000", "sh"])).expect_err("port rejected");
-    assert!(error.contains("between 1 and 65535"));
+    assert_eq!(
+        error.to_string(),
+        "invalid --https \"70000\": must be between 1 and 65535"
+    );
 }
 
 #[test]
@@ -71,7 +102,7 @@ fn parses_duration_units() {
     };
     assert_eq!(config.timeout, std::time::Duration::from_secs(45));
     let error = parse_config(&args(&["-timeout", "0s", "sh"])).expect_err("zero rejected");
-    assert!(error.contains("positive"));
+    assert!(error.to_string().contains("positive"));
 }
 
 #[test]
@@ -110,6 +141,7 @@ fn target_rejects_non_loopback_and_decorations() {
 }
 
 #[test]
-fn prints_usage() {
-    assert!(usage_text().starts_with("Usage: porthmeus [options] command [args ...]"));
+fn usage_leads_with_the_tagline_and_synopsis() {
+    assert!(USAGE.starts_with("Open your dev server on any device in your tailnet.\n\nUsage:\n"));
+    assert!(USAGE.contains("  porthmeus                            show every listening port"));
 }

@@ -37,15 +37,22 @@ pub fn process_table() -> Vec<ProcessInfo> {
     processes
 }
 
-/// Every listening TCP socket held by a process this user can inspect.
+/// Every listening TCP socket: `lsof` names the holders this user can
+/// inspect; `netstat` adds the rest without a pid.
 pub fn all_listeners() -> Result<Vec<Listener>, String> {
     // lsof exits 1 when no sockets match; `capture` keeps its output anyway.
-    let output = capture(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])?;
+    let output = capture(&["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpun"])?;
     let mut listeners = Vec::new();
     let mut pid: Option<u32> = None;
+    let mut uid: Option<u32> = None;
     for line in output.lines() {
         if let Some(value) = line.strip_prefix('p') {
             pid = value.parse().ok();
+            uid = None;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix('u') {
+            uid = value.parse().ok();
             continue;
         }
         let (Some(address), Some(pid)) = (line.strip_prefix('n'), pid) else {
@@ -68,12 +75,92 @@ pub fn all_listeners() -> Result<Vec<Listener>, String> {
         } else {
             continue;
         };
-        let listener = Listener { pid, ip, port };
+        let listener = Listener {
+            pid: Some(pid),
+            ip,
+            port,
+            uid,
+            cgroup: None,
+        };
         if !listeners.contains(&listener) {
             listeners.push(listener);
         }
     }
+    let known: Vec<(std::net::IpAddr, u16)> = listeners
+        .iter()
+        .map(|listener| (listener.ip, listener.port))
+        .collect();
+    for (ip, port) in netstat_listeners()? {
+        // lsof reports a dual-stack wildcard once, as `*`; netstat once per family.
+        let seen = known.iter().any(|(known_ip, known_port)| {
+            *known_port == port
+                && (*known_ip == ip || (known_ip.is_unspecified() && ip.is_unspecified()))
+        });
+        if !seen {
+            listeners.push(Listener {
+                pid: None,
+                ip,
+                port,
+                uid: None,
+                cgroup: None,
+            });
+        }
+    }
     Ok(listeners)
+}
+
+/// LISTEN addresses from `netstat -an -p tcp`, whose local column reads
+/// `127.0.0.1.5432`, `*.22`, or `::1.8080`.
+fn netstat_listeners() -> Result<Vec<(std::net::IpAddr, u16)>, String> {
+    let output = capture(&["netstat", "-an", "-p", "tcp"])?;
+    let mut found = Vec::new();
+    for line in output.lines().filter(|line| line.ends_with("LISTEN")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(proto), Some(local)) = (fields.first(), fields.get(3)) else {
+            continue;
+        };
+        let Some((host, port)) = local.rsplit_once('.') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        let host = host.split('%').next().unwrap_or(host);
+        let ip = match host {
+            "*" if proto.ends_with('6') => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            "*" => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            _ => match host.parse() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            },
+        };
+        if !found.contains(&(ip, port)) {
+            found.push((ip, port));
+        }
+    }
+    Ok(found)
+}
+
+/// No cgroups outside Linux.
+pub fn cgroup_index() -> std::collections::HashMap<u64, String> {
+    std::collections::HashMap::new()
+}
+
+pub fn cgroup_members(_path: &str) -> Vec<u32> {
+    Vec::new()
+}
+
+pub fn process_uid(pid: u32) -> Option<u32> {
+    let pid = pid.to_string();
+    capture(&["ps", "-o", "uid=", "-p", pid.as_str()])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub fn current_uid() -> Option<u32> {
+    process_uid(std::process::id())
 }
 
 /// Current directory of each pid, where readable.

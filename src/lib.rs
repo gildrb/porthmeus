@@ -6,4 +6,5 @@ pub mod proxy;
 pub mod runner;
 pub mod serve;
 pub mod signal;
+pub mod style;
 pub mod tailscale;
